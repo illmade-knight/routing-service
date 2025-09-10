@@ -2,70 +2,105 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	psadapter "github.com/illmade-knight/routing-service/internal/platform/pubsub" // Adapter
+	"github.com/illmade-knight/routing-service/internal/platform/persistence"
+	psadapter "github.com/illmade-knight/routing-service/internal/platform/pubsub"
 	"github.com/illmade-knight/routing-service/pkg/routing"
-	"github.com/illmade-knight/routing-service/routingservice" // Service Library
+	"github.com/illmade-knight/routing-service/routingservice"
 	"github.com/rs/zerolog"
 )
 
+// main is the entry point for the routing service application.
+// It initializes all components, starts the service, and handles graceful shutdown.
 func main() {
 	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 1. Load configuration from environment variables, flags, or a file
+	// 1. Load configuration from environment variables.
 	cfg := &routing.Config{
 		ProjectID:             os.Getenv("GCP_PROJECT_ID"),
-		HTTPListenAddr:        ":8080",
+		HTTPListenAddr:        ":8082",
 		IngressSubscriptionID: "ingress-sub",
 		IngressTopicID:        "ingress-topic",
 		NumPipelineWorkers:    10,
 	}
 
-	// 2. Initialize REAL external clients
+	// 2. Initialize external clients.
 	psClient, err := pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		log.Fatalf("Failed to create pubsub client: %v", err)
 	}
 	defer psClient.Close()
 
-	// 3. Instantiate CONCRETE adapters using the real clients
-	//    Here we choose our Google Cloud implementations.
+	// REFACTOR: Initialize the Firestore client for the message store.
+	fsClient, err := firestore.NewClient(ctx, cfg.ProjectID)
+	if err != nil {
+		log.Fatalf("Failed to create firestore client: %v", err)
+	}
+	defer fsClient.Close()
+
+	// 2.a [Temporary] Ensure topic and subscription exist for development.
+	topicID := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.IngressTopicID)
+	_, err = psClient.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{
+		Name: topicID,
+	})
+	if err != nil {
+		log.Printf("failed to create topic, may already exist: %v", err)
+	}
+	subID := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, cfg.IngressSubscriptionID)
+	_, err = psClient.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  subID,
+		Topic: topicID,
+	})
+	if err != nil {
+		log.Printf("failed to create subscription, may already exist: %v", err)
+	}
+
+	// 3. Instantiate CONCRETE adapters using the real clients.
 	consumerConfig := messagepipeline.NewGooglePubsubConsumerDefaults(cfg.IngressSubscriptionID)
 	consumer, err := messagepipeline.NewGooglePubsubConsumer(consumerConfig, psClient, logger)
 	if err != nil {
 		log.Fatalf("Failed to create pubsub consumer: %v", err)
 	}
 
-	ingestionTopic := psClient.Publisher(cfg.IngressTopicID)
-	ingestionProducer := psadapter.NewProducer(ingestionTopic)
+	ingestionPublisher := psClient.Publisher(cfg.IngressTopicID)
+	ingestionProducer := psadapter.NewProducer(ingestionPublisher)
 
-	// 4. Create other real dependencies (using nil/mocks for now)
+	// REFACTOR: Instantiate the concrete FirestoreStore.
+	messageStore, err := persistence.NewFirestoreStore(fsClient, logger)
+	if err != nil {
+		log.Fatalf("Failed to create firestore message store: %v", err)
+	}
+
+	// 4. Create other real dependencies.
 	deps := &routing.Dependencies{
-		// In a real application, you would initialize real Redis, Firestore, etc. clients here.
 		PresenceCache:      cache.NewInMemoryCache[string, routing.ConnectionInfo](nil),
 		DeviceTokenFetcher: cache.NewInMemoryCache[string, []routing.DeviceToken](nil),
 		DeliveryProducer:   &mockDeliveryProducer{}, // Placeholder
 		PushNotifier:       &mockPushNotifier{},     // Placeholder
+		MessageStore:       messageStore,            // REFACTOR: Inject the real message store.
 	}
 
-	// 5. Create the service using the public wrapper, injecting all dependencies
+	// 5. Create the service using the public wrapper, injecting all dependencies.
 	service, err := routingservice.New(cfg, deps, consumer, ingestionProducer, logger)
 	if err != nil {
 		log.Fatalf("Failed to create service: %v", err)
 	}
 
-	// 6. Start the service and handle graceful shutdown
+	// 6. Start the service and handle graceful shutdown.
 	go func() {
 		if err := service.Start(ctx); err != nil {
 			logger.Error().Err(err).Msg("Service failed to start")
@@ -88,7 +123,6 @@ func main() {
 }
 
 // mockDeliveryProducer and mockPushNotifier are placeholders for the main executable.
-// In a real scenario, these would be concrete implementations (e.g., another Pub/Sub producer).
 type mockDeliveryProducer struct{}
 
 func (m *mockDeliveryProducer) Publish(ctx context.Context, topicID string, data *transport.SecureEnvelope) error {

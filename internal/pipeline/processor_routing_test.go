@@ -8,51 +8,71 @@ import (
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/illmade-knight/routing-service/internal/pipeline" // Updated import
-	"github.com/illmade-knight/routing-service/pkg/routing"       // Updated import
-	"github.com/stretchr/testify/assert"
+	"github.com/illmade-knight/routing-service/internal/pipeline"
+	"github.com/illmade-knight/routing-service/pkg/routing"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// --- Mocks for Processor Dependencies ---
+// --- Mocks using testify/mock ---
 
-// mockFetcher is a test double for the generic cache.Fetcher interface.
+// REFACTOR: Use testify/mock for all mocks to ensure completeness and provide
+// better expectation setting and assertion capabilities.
+
 type mockFetcher[K comparable, V any] struct {
-	FetchFunc func(ctx context.Context, key K) (V, error)
+	mock.Mock
 }
 
 func (m *mockFetcher[K, V]) Fetch(ctx context.Context, key K) (V, error) {
-	if m.FetchFunc != nil {
-		return m.FetchFunc(ctx, key)
+	args := m.Called(ctx, key)
+	// Type assertion to handle the generic return value.
+	var result V
+	if val, ok := args.Get(0).(V); ok {
+		result = val
 	}
-	var zeroValue V
-	return zeroValue, errors.New("fetch function not implemented")
+	return result, args.Error(1)
 }
 
-func (m *mockFetcher[K, V]) Close() error { return nil }
+// NOTE: Adding the missing Close method to satisfy the interface.
+func (m *mockFetcher[K, V]) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
 
-// mockDeliveryProducer is a test double for the routing.DeliveryProducer interface.
 type mockDeliveryProducer struct {
-	PublishFunc func(ctx context.Context, topicID string, data *transport.SecureEnvelope) error
+	mock.Mock
 }
 
 func (m *mockDeliveryProducer) Publish(ctx context.Context, topicID string, data *transport.SecureEnvelope) error {
-	if m.PublishFunc != nil {
-		return m.PublishFunc(ctx, topicID, data)
-	}
-	return errors.New("publish function not implemented")
+	args := m.Called(ctx, topicID, data)
+	return args.Error(0)
 }
 
-// mockPushNotifier is a test double for the routing.PushNotifier interface.
 type mockPushNotifier struct {
-	NotifyFunc func(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error
+	mock.Mock
 }
 
 func (m *mockPushNotifier) Notify(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
-	if m.NotifyFunc != nil {
-		return m.NotifyFunc(ctx, tokens, envelope)
-	}
-	return errors.New("notify function not implemented")
+	args := m.Called(ctx, tokens, envelope)
+	return args.Error(0)
+}
+
+type mockMessageStore struct {
+	mock.Mock
+}
+
+func (m *mockMessageStore) Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error {
+	args := m.Called(ctx, userID, envelope)
+	return args.Error(0)
+}
+func (m *mockMessageStore) FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error) {
+	args := m.Called(ctx, userID)
+	return args.Get(0).([]*transport.SecureEnvelope), args.Error(1)
+}
+func (m *mockMessageStore) MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error {
+	args := m.Called(ctx, userID, envelopes)
+	return args.Error(0)
 }
 
 // --- Test Suite ---
@@ -61,69 +81,94 @@ func TestRoutingProcessor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
+	nopLogger := zerolog.Nop()
 	testEnvelope := &transport.SecureEnvelope{
-		RecipientID:           "user-bob",
-		EncryptedData:         []byte("test-data"),
-		EncryptedSymmetricKey: []byte("test-key"),
+		RecipientID: "user-bob",
 	}
 	testMessage := messagepipeline.Message{}
 
 	t.Run("Happy Path - User is Online", func(t *testing.T) {
 		// Arrange
-		presenceCache := &mockFetcher[string, routing.ConnectionInfo]{
-			FetchFunc: func(ctx context.Context, key string) (routing.ConnectionInfo, error) {
-				assert.Equal(t, "user-bob", key)
-				return routing.ConnectionInfo{ServerInstanceID: "pod-123"}, nil
-			},
-		}
-		producerCalled := false
-		deliveryProducer := &mockDeliveryProducer{
-			PublishFunc: func(ctx context.Context, topicID string, data *transport.SecureEnvelope) error {
-				producerCalled = true
-				assert.Equal(t, "delivery-pod-123", topicID)
-				assert.Equal(t, testEnvelope, data)
-				return nil
-			},
-		}
-		processor := pipeline.NewRoutingProcessor(presenceCache, nil, deliveryProducer, nil)
+		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		deliveryProducer := new(mockDeliveryProducer)
+		messageStore := new(mockMessageStore)
+
+		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{ServerInstanceID: "pod-123"}, nil)
+		deliveryProducer.On("Publish", mock.Anything, "delivery-pod-123", testEnvelope).Return(nil)
+
+		processor := pipeline.NewRoutingProcessor(presenceCache, nil, deliveryProducer, nil, messageStore, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
 
 		// Assert
 		require.NoError(t, err)
-		assert.True(t, producerCalled)
+		presenceCache.AssertExpectations(t)
+		deliveryProducer.AssertExpectations(t)
 	})
 
 	t.Run("Happy Path - User is Offline with Device Tokens", func(t *testing.T) {
 		// Arrange
-		presenceCache := &mockFetcher[string, routing.ConnectionInfo]{
-			FetchFunc: func(ctx context.Context, key string) (routing.ConnectionInfo, error) {
-				return routing.ConnectionInfo{}, errors.New("not found")
-			},
-		}
-		deviceTokenFetcher := &mockFetcher[string, []routing.DeviceToken]{
-			FetchFunc: func(ctx context.Context, key string) ([]routing.DeviceToken, error) {
-				assert.Equal(t, "user-bob", key)
-				return []routing.DeviceToken{{Token: "device-abc"}}, nil
-			},
-		}
-		notifierCalled := false
-		pushNotifier := &mockPushNotifier{
-			NotifyFunc: func(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
-				notifierCalled = true
-				require.Len(t, tokens, 1)
-				assert.Equal(t, "device-abc", tokens[0].Token)
-				return nil
-			},
-		}
-		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier)
+		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		deviceTokenFetcher := new(mockFetcher[string, []routing.DeviceToken])
+		messageStore := new(mockMessageStore)
+		pushNotifier := new(mockPushNotifier)
+		deviceTokens := []routing.DeviceToken{{Token: "device-abc"}}
+
+		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
+		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(nil)
+		deviceTokenFetcher.On("Fetch", mock.Anything, "user-bob").Return(deviceTokens, nil)
+		pushNotifier.On("Notify", mock.Anything, deviceTokens, testEnvelope).Return(nil)
+
+		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier, messageStore, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
 
 		// Assert
 		require.NoError(t, err)
-		assert.True(t, notifierCalled)
+		mock.AssertExpectationsForObjects(t, presenceCache, messageStore, deviceTokenFetcher, pushNotifier)
+	})
+
+	t.Run("Offline - No Device Tokens Found", func(t *testing.T) {
+		// Arrange
+		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		deviceTokenFetcher := new(mockFetcher[string, []routing.DeviceToken])
+		messageStore := new(mockMessageStore)
+		pushNotifier := new(mockPushNotifier) // Not called, so no expectations set
+
+		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
+		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(nil)
+		deviceTokenFetcher.On("Fetch", mock.Anything, "user-bob").Return([]routing.DeviceToken(nil), errors.New("no tokens"))
+
+		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier, messageStore, nopLogger)
+
+		// Act
+		err := processor(ctx, testMessage, testEnvelope)
+
+		// Assert
+		require.NoError(t, err, "Failing to find tokens should not be a processing error")
+		mock.AssertExpectationsForObjects(t, presenceCache, messageStore, deviceTokenFetcher)
+		pushNotifier.AssertNotCalled(t, "Notify", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("Offline - Message Store Fails", func(t *testing.T) {
+		// Arrange
+		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		messageStore := new(mockMessageStore)
+		expectedErr := "db is down"
+
+		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
+		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(errors.New(expectedErr))
+
+		processor := pipeline.NewRoutingProcessor(presenceCache, nil, nil, nil, messageStore, nopLogger)
+
+		// Act
+		err := processor(ctx, testMessage, testEnvelope)
+
+		// Assert
+		require.Error(t, err)
+		require.ErrorContains(t, err, expectedErr)
+		mock.AssertExpectationsForObjects(t, presenceCache, messageStore)
 	})
 }

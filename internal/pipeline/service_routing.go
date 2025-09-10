@@ -12,7 +12,7 @@ type Config struct {
 	NumWorkers int
 }
 
-// NewService creates and configures the entire message processing pipeline.
+// NewService creates and assembles the entire message processing pipeline.
 // It accepts a generic consumer and wires it up with our application-specific
 // transformer and processor.
 func NewService(
@@ -22,12 +22,14 @@ func NewService(
 	logger zerolog.Logger,
 ) (*messagepipeline.StreamingService[transport.SecureEnvelope], error) {
 
-	// 1. Create the message handler (the processor).
+	// 1. Create the message handler (the processor), injecting its dependencies.
 	processor := NewRoutingProcessor(
 		deps.PresenceCache,
 		deps.DeviceTokenFetcher,
 		deps.DeliveryProducer,
 		deps.PushNotifier,
+		deps.MessageStore, // REFACTOR: Pass the MessageStore dependency.
+		logger,            // REFACTOR: Pass the structured logger.
 	)
 
 	// 2. Assemble the pipeline using the generic StreamingService component.

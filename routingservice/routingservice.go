@@ -43,10 +43,22 @@ func New(
 		return nil, fmt.Errorf("failed to create pipeline service: %w", err)
 	}
 
-	// ...and the internal API handlers.
-	apiHandler := api.NewAPI(producer, logger)
+	// ...and the internal API handlers, now with the message store.
+	// REFACTOR: Pass the MessageStore dependency to the API constructor.
+	apiHandler := api.NewAPI(producer, deps.MessageStore, logger)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/send", apiHandler.SendHandler)
+
+	// This handler does nothing, but it's needed to complete the middleware chain for OPTIONS.
+	doNothingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+	// Register routes for the /send endpoint.
+	mux.Handle("OPTIONS /send", api.CorsMiddleware(doNothingHandler))
+	mux.Handle("POST /send", api.CorsMiddleware(http.HandlerFunc(apiHandler.SendHandler)))
+
+	// REFACTOR: Register routes for the new /messages endpoint.
+	mux.Handle("OPTIONS /messages", api.CorsMiddleware(doNothingHandler))
+	mux.Handle("GET /messages", api.CorsMiddleware(http.HandlerFunc(apiHandler.GetMessagesHandler)))
+
 	apiServer := &http.Server{Addr: cfg.HTTPListenAddr, Handler: mux}
 
 	wrapper := &Wrapper{
@@ -61,7 +73,8 @@ func New(
 // Start runs the service's background components.
 func (w *Wrapper) Start(ctx context.Context) error {
 	w.logger.Info().Msg("Core processing pipeline starting.")
-	if err := w.processingService.Start(ctx); err != nil {
+	err := w.processingService.Start(ctx)
+	if err != nil {
 		return fmt.Errorf("failed to start processing service: %w", err)
 	}
 

@@ -23,3 +23,20 @@ type DeliveryProducer interface {
 type PushNotifier interface {
 	Notify(ctx context.Context, tokens []DeviceToken, envelope *transport.SecureEnvelope) error
 }
+
+// REFACTOR: Add the new MessageStore interface for offline message persistence.
+
+// MessageStore defines the contract for a persistence layer that stores messages
+// for users who are offline.
+type MessageStore interface {
+	// Store saves a message envelope for a specific user.
+	Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error
+
+	// FetchUndelivered retrieves all messages for a user that have not yet
+	// been delivered.
+	FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error)
+
+	// MarkDelivered marks a set of messages as delivered so they are not
+	// retrieved again. This could be implemented as a delete or a status update.
+	MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error
+}

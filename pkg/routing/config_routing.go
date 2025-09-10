@@ -24,4 +24,5 @@ type Dependencies struct {
 	DeviceTokenFetcher cache.Fetcher[string, []DeviceToken]
 	DeliveryProducer   DeliveryProducer
 	PushNotifier       PushNotifier
+	MessageStore       MessageStore
 }
