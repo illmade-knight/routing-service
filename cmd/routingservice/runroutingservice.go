@@ -1,3 +1,7 @@
+// REFACTOR: This file is updated to correctly instantiate dependencies with the
+// new urn.URN type, completing the URN migration. The mock implementations
+// have also been updated to correctly handle the URN type in their logging.
+
 package main
 
 import (
@@ -15,6 +19,7 @@ import (
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/internal/platform/persistence"
 	psadapter "github.com/illmade-knight/routing-service/internal/platform/pubsub"
 	"github.com/illmade-knight/routing-service/pkg/routing"
@@ -45,7 +50,6 @@ func main() {
 	}
 	defer psClient.Close()
 
-	// REFACTOR: Initialize the Firestore client for the message store.
 	fsClient, err := firestore.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		log.Fatalf("Failed to create firestore client: %v", err)
@@ -53,15 +57,17 @@ func main() {
 	defer fsClient.Close()
 
 	// 2.a [Temporary] Ensure topic and subscription exist for development.
+	topicAdminClient := psClient.TopicAdminClient
+	subAdminClient := psClient.SubscriptionAdminClient
 	topicID := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.IngressTopicID)
-	_, err = psClient.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{
+	_, err = topicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{
 		Name: topicID,
 	})
 	if err != nil {
 		log.Printf("failed to create topic, may already exist: %v", err)
 	}
 	subID := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, cfg.IngressSubscriptionID)
-	_, err = psClient.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+	_, err = subAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
 		Name:  subID,
 		Topic: topicID,
 	})
@@ -79,19 +85,19 @@ func main() {
 	ingestionPublisher := psClient.Publisher(cfg.IngressTopicID)
 	ingestionProducer := psadapter.NewProducer(ingestionPublisher)
 
-	// REFACTOR: Instantiate the concrete FirestoreStore.
 	messageStore, err := persistence.NewFirestoreStore(fsClient, logger)
 	if err != nil {
 		log.Fatalf("Failed to create firestore message store: %v", err)
 	}
 
 	// 4. Create other real dependencies.
+	// REFACTOR: Instantiate caches with the correct urn.URN key type.
 	deps := &routing.Dependencies{
-		PresenceCache:      cache.NewInMemoryCache[string, routing.ConnectionInfo](nil),
-		DeviceTokenFetcher: cache.NewInMemoryCache[string, []routing.DeviceToken](nil),
+		PresenceCache:      cache.NewInMemoryCache[urn.URN, routing.ConnectionInfo](nil),
+		DeviceTokenFetcher: cache.NewInMemoryCache[urn.URN, []routing.DeviceToken](nil),
 		DeliveryProducer:   &mockDeliveryProducer{}, // Placeholder
 		PushNotifier:       &mockPushNotifier{},     // Placeholder
-		MessageStore:       messageStore,            // REFACTOR: Inject the real message store.
+		MessageStore:       messageStore,
 	}
 
 	// 5. Create the service using the public wrapper, injecting all dependencies.
@@ -126,13 +132,15 @@ func main() {
 type mockDeliveryProducer struct{}
 
 func (m *mockDeliveryProducer) Publish(ctx context.Context, topicID string, data *transport.SecureEnvelope) error {
-	log.Printf("MOCK: Publishing to delivery topic %s for user %s", topicID, data.RecipientID)
+	// REFACTOR: Use the .String() method to correctly log the URN.
+	log.Printf("MOCK: Publishing to delivery topic %s for user %s", topicID, data.RecipientID.String())
 	return nil
 }
 
 type mockPushNotifier struct{}
 
-func (m *mockPushNotifier) Notify(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
-	log.Printf("MOCK: Sending push notification to %d devices for user %s", len(tokens), envelope.RecipientID)
+func (m *mockPushNotifier) Notify(_ context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
+	// REFACTOR: Use the .String() method to correctly log the URN.
+	log.Printf("MOCK: Sending push notification to %d devices for user %s", len(tokens), envelope.RecipientID.String())
 	return nil
 }

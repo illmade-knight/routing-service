@@ -1,103 +1,130 @@
-// Package api contains the HTTP handlers and other API-related components
-// for the routing service.
+// REFACTOR: This file is updated to use the canonical transport.SecureEnvelope
+// from the external repository, which now includes urn.URN fields. This
+// simplifies the handler logic significantly.
+
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/pkg/routing"
 	"github.com/rs/zerolog"
 )
 
-// API holds the dependencies for the HTTP handlers, such as the logger,
-// message producer, and message store.
+// API holds the dependencies for the HTTP handlers.
 type API struct {
 	producer routing.IngestionProducer
-	// REFACTOR: Add the MessageStore to handle fetching offline messages.
-	store  routing.MessageStore
-	logger zerolog.Logger
+	store    routing.MessageStore
+	logger   zerolog.Logger
 }
 
-// NewAPI is the constructor for the API struct.
+// NewAPI creates a new API handler with the necessary dependencies.
 func NewAPI(producer routing.IngestionProducer, store routing.MessageStore, logger zerolog.Logger) *API {
-	api := &API{
+	return &API{
 		producer: producer,
 		store:    store,
 		logger:   logger,
 	}
-	return api
 }
 
-// SendHandler is the HTTP handler for the POST /send endpoint.
-// It decodes a SecureEnvelope from the request body and passes it to the
-// IngestionProducer to be queued for processing.
-func (a *API) SendHandler(writer http.ResponseWriter, request *http.Request) {
-	var err error
-
+// SendHandler handles the ingestion of new messages. It decodes the envelope
+// and publishes it to the central ingestion pipeline.
+func (a *API) SendHandler(w http.ResponseWriter, r *http.Request) {
 	var envelope transport.SecureEnvelope
-	err = json.NewDecoder(request.Body).Decode(&envelope)
+	err := json.NewDecoder(r.Body).Decode(&envelope)
 	if err != nil {
-		a.logger.Warn().Err(err).Msg("Failed to decode request body")
-		http.Error(writer, "Bad Request: malformed JSON", http.StatusBadRequest)
+		a.logger.Warn().Err(err).Msg("Failed to decode secure envelope")
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	err = a.producer.Publish(request.Context(), &envelope)
-	if err != nil {
-		a.logger.Error().Err(err).Msg("Failed to publish envelope to message bus")
-		http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
+	// Because the canonical SecureEnvelope now has a urn.URN RecipientID field,
+	// the custom UnmarshalJSON in the urn package handles backward
+	// compatibility for us. We just need to validate that the result is valid.
+	if envelope.RecipientID.IsZero() {
+		a.logger.Warn().Msg("Recipient ID is missing or invalid")
+		http.Error(w, "Recipient ID is missing or invalid", http.StatusBadRequest)
 		return
 	}
 
-	writer.WriteHeader(http.StatusAccepted)
+	logger := a.logger.With().Str("recipient_id", envelope.RecipientID.String()).Logger()
+
+	err = a.producer.Publish(r.Context(), &envelope)
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to publish message to ingestion topic")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	logger.Info().Msg("Message accepted for ingestion")
 }
 
-// REFACTOR: Add the handler for retrieving offline messages.
-
-// GetMessagesHandler is the HTTP handler for the GET /messages endpoint.
-// It fetches all stored messages for an authenticated user, marks them as
-// delivered, and returns them to the client.
-func (a *API) GetMessagesHandler(writer http.ResponseWriter, request *http.Request) {
-	// NOTE: In a real application, the userID would be extracted from a JWT
-	// or session token after an authentication middleware has run.
-	// For now, we'll read it from a header as a placeholder.
-	userID := request.Header.Get("X-User-ID")
-	if userID == "" {
-		http.Error(writer, "Unauthorized: Missing X-User-ID header", http.StatusUnauthorized)
+// GetMessagesHandler retrieves and clears any stored offline messages for a user.
+func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	recipientHeader := r.Header.Get("X-User-ID")
+	if recipientHeader == "" {
+		a.logger.Warn().Msg("Missing X-User-ID header")
+		http.Error(w, "Missing X-User-ID header", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Fetch all undelivered messages from the store.
-	messages, err := a.store.FetchUndelivered(request.Context(), userID)
+	// This endpoint is specifically for users retrieving their messages. We can
+	// robustly determine the user's URN by re-using the UnmarshalJSON logic
+	// on the header value. This correctly handles both legacy userIDs and full URNs.
+	var recipientURN urn.URN
+	// We wrap the header in quotes to make it a valid JSON string for unmarshaling.
+	err := json.Unmarshal([]byte(`"`+recipientHeader+`"`), &recipientURN)
+	if err != nil || recipientURN.IsZero() || recipientURN.EntityType != urn.EntityTypeUser {
+		a.logger.Warn().Err(err).Str("header_value", recipientHeader).Msg("Invalid or non-user X-User-ID format")
+		http.Error(w, "Invalid X-User-ID format", http.StatusBadRequest)
+		return
+	}
+
+	logger := a.logger.With().Str("recipient_id", recipientURN.String()).Logger()
+
+	envelopes, err := a.store.RetrieveMessages(r.Context(), recipientURN)
 	if err != nil {
-		a.logger.Error().Err(err).Str("userID", userID).Msg("Failed to fetch undelivered messages")
-		http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
+		logger.Error().Err(err).Msg("Failed to retrieve messages from store")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Respond to the client with the messages.
-	writer.Header().Set("Content-Type", "application/json")
-	writer.WriteHeader(http.StatusOK)
-	err = json.NewEncoder(writer).Encode(messages)
+	if len(envelopes) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(envelopes)
 	if err != nil {
-		a.logger.Error().Err(err).Str("userID", userID).Msg("Failed to encode messages to response")
-		// Can't send http.Error here as headers/status are already written.
+		logger.Error().Err(err).Msg("Failed to encode messages to response")
 		return
 	}
 
-	// 3. After successful delivery, mark the messages as delivered in the store.
-	// This prevents them from being sent again.
-	if len(messages) > 0 {
-		err = a.store.MarkDelivered(request.Context(), userID, messages)
-		if err != nil {
-			// This is a problematic state: the client has the messages, but we
-			// failed to mark them as delivered. They will receive duplicates next time.
-			// A robust system might use a two-phase commit or transactional outbox
-			// pattern here, but for now, we just log this critical failure.
-			a.logger.Error().Err(err).Str("userID", userID).Int("count", len(messages)).
-				Msg("CRITICAL: Failed to mark messages as delivered after sending to client")
+	// Asynchronously delete the messages now that they have been delivered.
+	go func() {
+		messageIDs := make([]string, 0, len(envelopes))
+		for _, e := range envelopes {
+			if e != nil {
+				messageIDs = append(messageIDs, e.MessageID)
+			}
 		}
-	}
+
+		// Only proceed if there are actual message IDs to delete.
+		if len(messageIDs) == 0 {
+			return
+		}
+
+		err := a.store.DeleteMessages(context.Background(), recipientURN, messageIDs)
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to delete delivered messages from store")
+		} else {
+			logger.Info().Int("count", len(messageIDs)).Msg("Successfully deleted delivered messages")
+		}
+	}()
 }

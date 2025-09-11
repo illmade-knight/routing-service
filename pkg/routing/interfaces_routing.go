@@ -1,42 +1,37 @@
+// REFACTOR: This new file consolidates all public domain models for the
+// routing service into a single location for clarity and maintainability.
+// It also introduces the urn.URN type for all entity identifiers.
+
+// Package routing contains the public "contract" for the routing service,
+// including its domain models, interfaces, and configuration.
 package routing
 
 import (
 	"context"
 
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 )
 
-// IngestionProducer defines the interface for a component that can publish a
-// received envelope to the internal message bus for processing.
+// IngestionProducer defines the interface for publishing a message into the pipeline.
 type IngestionProducer interface {
 	Publish(ctx context.Context, envelope *transport.SecureEnvelope) error
 }
 
-// DeliveryProducer defines the interface for a component that can publish a message
-// to a specific, targeted topic for real-time delivery to an online user.
+// DeliveryProducer defines the interface for publishing a message to a specific delivery topic.
 type DeliveryProducer interface {
-	Publish(ctx context.Context, topicID string, data *transport.SecureEnvelope) error
+	Publish(ctx context.Context, topicID string, envelope *transport.SecureEnvelope) error
 }
 
-// PushNotifier defines the interface for a component that can send push
-// notifications to offline users' devices.
+// PushNotifier defines the interface for sending push notifications.
 type PushNotifier interface {
 	Notify(ctx context.Context, tokens []DeviceToken, envelope *transport.SecureEnvelope) error
 }
 
-// REFACTOR: Add the new MessageStore interface for offline message persistence.
-
-// MessageStore defines the contract for a persistence layer that stores messages
-// for users who are offline.
+// MessageStore defines the interface for persisting and retrieving messages
+// for offline users.
 type MessageStore interface {
-	// Store saves a message envelope for a specific user.
-	Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error
-
-	// FetchUndelivered retrieves all messages for a user that have not yet
-	// been delivered.
-	FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error)
-
-	// MarkDelivered marks a set of messages as delivered so they are not
-	// retrieved again. This could be implemented as a delete or a status update.
-	MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error
+	StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error
+	RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error)
+	DeleteMessages(ctx context.Context, recipient urn.URN, messageIDs []string) error
 }

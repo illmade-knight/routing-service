@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"cloud.google.com/go/pubsub/v2/pstest"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	ps "github.com/illmade-knight/routing-service/internal/platform/pubsub" // Aliased import
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,13 +25,12 @@ func TestProducer_Publish(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 
-	// Arrange: Set up the pstest in-memory server
+	// Arrange: Set up the v2 pstest in-memory server
 	srv := pstest.NewServer()
-	defer srv.Close()
 
 	conn, err := grpc.NewClient(srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
 
 	// Arrange: Create v2 clients
 	const projectID = "test-project"
@@ -39,31 +39,37 @@ func TestProducer_Publish(t *testing.T) {
 
 	client, err := pubsub.NewClient(ctx, projectID, option.WithGRPCConn(conn))
 	require.NoError(t, err)
-	defer client.Close()
+	t.Cleanup(func() { _ = client.Close() })
 
-	topicAdmin := client.TopicAdminClient
-	subAdmin := client.SubscriptionAdminClient
+	// REFACTOR: Use the main client to get the admin clients, which is the
+	// correct and idiomatic approach.
+	topicAdminClient := client.TopicAdminClient
+	subAdminClient := client.SubscriptionAdminClient
 
-	// Arrange: Create v2 Topic and Subscription resources
 	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)
-	_, err = topicAdmin.CreateTopic(ctx, &pubsubpb.Topic{Name: topicName})
+	_, err = topicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicName})
 	require.NoError(t, err)
 
 	subName := fmt.Sprintf("projects/%s/subscriptions/%s", projectID, subID)
-	_, err = subAdmin.CreateSubscription(ctx, &pubsubpb.Subscription{
+	_, err = subAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
 		Name:  subName,
 		Topic: topicName,
 	})
 	require.NoError(t, err)
 
-	// Arrange: Get the topic object and create the producer to be tested
-	topic := client.Publisher(topicID)
-	producer := ps.NewProducer(topic)
+	// Arrange: Create the producer to be tested
+	publisher := client.Publisher(topicID)
+	producer := ps.NewProducer(publisher)
 
-	// Arrange: Use the correct SecureEnvelope struct
+	// Arrange: Create a valid URN-based SecureEnvelope for the test.
+	senderURN, err := urn.Parse("urn:sm:user:user-alice")
+	require.NoError(t, err)
+	recipientURN, err := urn.Parse("urn:sm:user:user-bob")
+	require.NoError(t, err)
+
 	testEnvelope := &transport.SecureEnvelope{
-		SenderID:              "user-alice",
-		RecipientID:           "user-bob",
+		SenderID:              senderURN,
+		RecipientID:           recipientURN,
 		EncryptedData:         []byte("encrypted-payload"),
 		EncryptedSymmetricKey: []byte("encrypted-key"),
 		Signature:             []byte("signature"),
@@ -102,8 +108,9 @@ func TestProducer_Publish(t *testing.T) {
 	var receivedEnvelope transport.SecureEnvelope
 	err = json.Unmarshal(receivedMsg.Data, &receivedEnvelope)
 	require.NoError(t, err)
-	// Assert using the correct fields
+
 	assert.Equal(t, testEnvelope.RecipientID, receivedEnvelope.RecipientID)
+	assert.Equal(t, testEnvelope.SenderID, receivedEnvelope.SenderID)
 	assert.Equal(t, testEnvelope.EncryptedData, receivedEnvelope.EncryptedData)
 	assert.Equal(t, testEnvelope.Signature, receivedEnvelope.Signature)
 }

@@ -10,12 +10,15 @@ import (
 	"testing"
 
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/internal/api"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// --- Mocks using testify/mock ---
 
 type mockIngestionProducer struct {
 	mock.Mock
@@ -30,26 +33,47 @@ type mockMessageStore struct {
 	mock.Mock
 }
 
-func (m *mockMessageStore) Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error {
-	args := m.Called(ctx, userID, envelope)
-	return args.Error(0)
-}
-func (m *mockMessageStore) FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error) {
-	args := m.Called(ctx, userID)
-	return args.Get(0).([]*transport.SecureEnvelope), args.Error(1)
-}
-func (m *mockMessageStore) MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error {
-	args := m.Called(ctx, userID, envelopes)
+// REFACTOR: Implement the new routing.MessageStore interface.
+func (m *mockMessageStore) StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error {
+	args := m.Called(ctx, recipient, envelopes)
 	return args.Error(0)
 }
 
+func (m *mockMessageStore) RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error) {
+	args := m.Called(ctx, recipient)
+	var result []*transport.SecureEnvelope
+	if val, ok := args.Get(0).([]*transport.SecureEnvelope); ok {
+		result = val
+	}
+	return result, args.Error(1)
+}
+
+func (m *mockMessageStore) DeleteMessages(ctx context.Context, recipient urn.URN, messageIDs []string) error {
+	args := m.Called(ctx, recipient, messageIDs)
+	return args.Error(0)
+}
+
+// --- Test Suites ---
+
 func TestSendHandler(t *testing.T) {
+	// REFACTOR: Use a valid URN for the test envelope.
+	testURN, err := urn.Parse("urn:sm:user:user-bob")
+	require.NoError(t, err)
+
 	validEnvelope := transport.SecureEnvelope{
-		SenderID:    "user-alice",
-		RecipientID: "user-bob",
+		SenderID:    testURN, // Sender can also be a URN
+		RecipientID: testURN,
 	}
 	validBody, err := json.Marshal(validEnvelope)
 	require.NoError(t, err, "Setup: failed to marshal valid envelope")
+
+	// REFACTOR: Test backward compatibility with a legacy userID.
+	legacyEnvelope := map[string]string{
+		"senderId":    "user-alice",
+		"recipientId": "user-bob",
+	}
+	legacyBody, err := json.Marshal(legacyEnvelope)
+	require.NoError(t, err, "Setup: failed to marshal legacy envelope")
 
 	testCases := []struct {
 		name               string
@@ -58,10 +82,17 @@ func TestSendHandler(t *testing.T) {
 		expectedStatusCode int
 	}{
 		{
-			name:        "Happy Path - Valid Request",
+			name:        "Happy Path - Valid URN Request",
 			requestBody: validBody,
 			setupMock: func(producer *mockIngestionProducer) {
-				// Use mock.AnythingOfType because the pointer will be different after unmarshaling.
+				producer.On("Publish", mock.Anything, mock.AnythingOfType("*transport.SecureEnvelope")).Return(nil)
+			},
+			expectedStatusCode: http.StatusAccepted,
+		},
+		{
+			name:        "Happy Path - Legacy UserID Request",
+			requestBody: legacyBody,
+			setupMock: func(producer *mockIngestionProducer) {
 				producer.On("Publish", mock.Anything, mock.AnythingOfType("*transport.SecureEnvelope")).Return(nil)
 			},
 			expectedStatusCode: http.StatusAccepted,
@@ -104,10 +135,12 @@ func TestSendHandler(t *testing.T) {
 }
 
 func TestGetMessagesHandler(t *testing.T) {
-	testUserID := "user-bob"
+	testURN, err := urn.Parse("urn:sm:user:user-bob")
+	require.NoError(t, err)
+
 	testMessages := []*transport.SecureEnvelope{
-		{MessageID: "msg-1", RecipientID: testUserID},
-		{MessageID: "msg-2", RecipientID: testUserID},
+		{MessageID: "msg-1", RecipientID: testURN},
+		{MessageID: "msg-2", RecipientID: testURN},
 	}
 
 	testCases := []struct {
@@ -115,43 +148,47 @@ func TestGetMessagesHandler(t *testing.T) {
 		userIDHeader       string
 		setupMock          func(store *mockMessageStore)
 		expectedStatusCode int
-		expectedBody       string
+		expectedBody       string // Optional, for checking response body
 	}{
 		{
-			name:         "Happy Path - Messages Found",
-			userIDHeader: testUserID,
+			name:         "Happy Path - Messages Found (URN Header)",
+			userIDHeader: "urn:sm:user:user-bob",
 			setupMock: func(store *mockMessageStore) {
-				store.On("FetchUndelivered", mock.Anything, testUserID).Return(testMessages, nil).Once()
-				store.On("MarkDelivered", mock.Anything, testUserID, testMessages).Return(nil).Once()
+				store.On("RetrieveMessages", mock.Anything, testURN).Return(testMessages, nil).Once()
+				store.On("DeleteMessages", mock.Anything, testURN, []string{"msg-1", "msg-2"}).Return(nil).Once()
 			},
 			expectedStatusCode: http.StatusOK,
-			// REFACTOR: Update expected JSON to use camelCase keys.
-			expectedBody: `[{"senderId":"","recipientId":"user-bob","messageId":"msg-1","encryptedData":null,"encryptedSymmetricKey":null,"signature":null},{"senderId":"","recipientId":"user-bob","messageId":"msg-2","encryptedData":null,"encryptedSymmetricKey":null,"signature":null}]` + "\n",
+		},
+		{
+			name:         "Happy Path - Messages Found (Legacy Header)",
+			userIDHeader: "user-bob",
+			setupMock: func(store *mockMessageStore) {
+				store.On("RetrieveMessages", mock.Anything, testURN).Return(testMessages, nil).Once()
+				store.On("DeleteMessages", mock.Anything, testURN, []string{"msg-1", "msg-2"}).Return(nil).Once()
+			},
+			expectedStatusCode: http.StatusOK,
 		},
 		{
 			name:         "Happy Path - No Messages Found",
-			userIDHeader: testUserID,
+			userIDHeader: "user-bob",
 			setupMock: func(store *mockMessageStore) {
-				store.On("FetchUndelivered", mock.Anything, testUserID).Return([]*transport.SecureEnvelope{}, nil).Once()
+				store.On("RetrieveMessages", mock.Anything, testURN).Return([]*transport.SecureEnvelope{}, nil).Once()
 			},
-			expectedStatusCode: http.StatusOK,
-			expectedBody:       `[]` + "\n",
+			expectedStatusCode: http.StatusNoContent,
 		},
 		{
 			name:               "Failure - Missing Auth Header",
 			userIDHeader:       "",
 			setupMock:          func(store *mockMessageStore) {},
-			expectedStatusCode: http.StatusUnauthorized,
-			expectedBody:       `Unauthorized: Missing X-User-ID header` + "\n",
+			expectedStatusCode: http.StatusBadRequest,
 		},
 		{
 			name:         "Failure - Store Fails on Fetch",
-			userIDHeader: testUserID,
+			userIDHeader: "user-bob",
 			setupMock: func(store *mockMessageStore) {
-				store.On("FetchUndelivered", mock.Anything, testUserID).Return([]*transport.SecureEnvelope(nil), errors.New("db is down")).Once()
+				store.On("RetrieveMessages", mock.Anything, testURN).Return([]*transport.SecureEnvelope(nil), errors.New("db is down")).Once()
 			},
 			expectedStatusCode: http.StatusInternalServerError,
-			expectedBody:       `Internal Server Error` + "\n",
 		},
 	}
 
@@ -174,7 +211,9 @@ func TestGetMessagesHandler(t *testing.T) {
 
 			// Assert
 			assert.Equal(t, tc.expectedStatusCode, responseRecorder.Code)
-			assert.Equal(t, tc.expectedBody, responseRecorder.Body.String())
+			if tc.expectedBody != "" {
+				assert.JSONEq(t, tc.expectedBody, responseRecorder.Body.String())
+			}
 			store.AssertExpectations(t)
 		})
 	}

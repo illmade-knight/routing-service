@@ -2,24 +2,14 @@
 // for the routing service. It defines the contract for interacting with the service.
 package routing
 
-// ConnectionInfo holds real-time presence data for a connected user.
-// This struct will be stored in Redis for fast lookups.
+// ConnectionInfo holds details about a user's real-time connection.
 type ConnectionInfo struct {
-	// ServerInstanceID is the unique identifier of the server instance
-	// handling the user's persistent connection (e.g., a pod name in Kubernetes).
-	ServerInstanceID string `json:"server_instance_id"`
-
-	// Protocol indicates the type of connection the user has established.
-	// Valid values are "websocket" or "mqtt".
-	Protocol string `json:"protocol"`
+	ServerInstanceID string `json:"serverInstanceId"`
+	ConnectedAt      int64  `json:"connectedAt"`
 }
 
-// DeviceToken represents a single device token for push notifications.
-// This struct will be stored in Firestore for persistent, long-term storage.
+// DeviceToken represents a push notification token for a user's device.
 type DeviceToken struct {
-	// Token is the actual push notification token provided by the client's OS.
-	Token string `firestore:"token"`
-
-	// Platform indicates the mobile operating system, e.g., "ios" or "android".
-	Platform string `firestore:"platform"`
+	Token    string `json:"token"`
+	Platform string `json:"platform"` // e.g., "ios", "android"
 }

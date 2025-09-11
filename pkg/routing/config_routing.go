@@ -1,27 +1,24 @@
 package routing
 
 import (
-	"cloud.google.com/go/pubsub/v2"
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
-	"google.golang.org/api/option"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 )
 
-// Config holds all the necessary configuration for the routing service.
+// Config holds all necessary configuration for the routing service.
 type Config struct {
 	ProjectID             string
 	HTTPListenAddr        string
 	IngressSubscriptionID string
 	IngressTopicID        string
 	NumPipelineWorkers    int
-	PubsubClientOptions   []option.ClientOption
 }
 
-// Dependencies holds all the external components the service wrapper needs to run.
-// These are provided as interfaces to decouple the wrapper from concrete implementations.
+// Dependencies holds all the external services the routing service needs to operate.
 type Dependencies struct {
-	PubsubClient       *pubsub.Client
-	PresenceCache      cache.Fetcher[string, ConnectionInfo]
-	DeviceTokenFetcher cache.Fetcher[string, []DeviceToken]
+	// REFACTOR: The generic caches now use urn.URN as the key for type safety.
+	PresenceCache      cache.Fetcher[urn.URN, ConnectionInfo]
+	DeviceTokenFetcher cache.Fetcher[urn.URN, []DeviceToken]
 	DeliveryProducer   DeliveryProducer
 	PushNotifier       PushNotifier
 	MessageStore       MessageStore

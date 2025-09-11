@@ -1,4 +1,7 @@
-// Package test provides public helpers for running end-to-end tests against the service.
+// REFACTOR: This file contains corrected test helpers that now correctly
+// provide URN-keyed dependencies by creating string-keyed concrete types and
+// wrapping them in the necessary adapters.
+
 package test
 
 import (
@@ -8,47 +11,29 @@ import (
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/internal/platform/persistence"
 	psadapter "github.com/illmade-knight/routing-service/internal/platform/pubsub"
 	"github.com/illmade-knight/routing-service/pkg/routing"
 	"github.com/rs/zerolog"
 )
 
-// deviceTokenDoc matches the structure of the document stored in Firestore.
+// deviceTokenDoc is the shape of the data stored in Firestore for device tokens.
 type deviceTokenDoc struct {
 	Tokens []routing.DeviceToken
 }
 
-// FirestoreTokenAdapter wraps the generic Firestore fetcher to satisfy the specific
-// interface required by the routing service's dependencies.
-type FirestoreTokenAdapter struct {
-	docFetcher cache.Fetcher[string, deviceTokenDoc]
-}
-
-// Fetch implements the `cache.Fetcher[string, []routing.DeviceToken]` interface.
-func (a *FirestoreTokenAdapter) Fetch(ctx context.Context, key string) ([]routing.DeviceToken, error) {
-	doc, err := a.docFetcher.Fetch(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	return doc.Tokens, nil
-}
-
-// Close satisfies the io.Closer part of the interface.
-func (a *FirestoreTokenAdapter) Close() error {
-	return a.docFetcher.Close()
-}
-
-// --- Test Helper Constructors ---
-
-// NewTestFirestoreTokenFetcher creates a Firestore fetcher and wraps it in the required adapter.
+// NewTestFirestoreTokenFetcher creates a URN-keyed fetcher for testing.
+// It does this by creating a concrete, string-keyed Firestore fetcher and
+// wrapping it in our URN adapter. This encapsulates the logic for the test.
 func NewTestFirestoreTokenFetcher(
 	ctx context.Context,
 	fsClient *firestore.Client,
 	projectID string,
 	logger zerolog.Logger,
-) (cache.Fetcher[string, []routing.DeviceToken], error) {
-	firestoreDocFetcher, err := cache.NewFirestore[string, deviceTokenDoc](
+) (cache.Fetcher[urn.URN, []routing.DeviceToken], error) {
+	// 1. Create the concrete, string-keyed Firestore fetcher.
+	stringDocFetcher, err := cache.NewFirestore[string, deviceTokenDoc](
 		ctx,
 		&cache.FirestoreConfig{ProjectID: projectID, CollectionName: "device-tokens"},
 		fsClient,
@@ -57,7 +42,14 @@ func NewTestFirestoreTokenFetcher(
 	if err != nil {
 		return nil, err
 	}
-	return &FirestoreTokenAdapter{docFetcher: firestoreDocFetcher}, nil
+
+	// 2. Create an adapter that extracts the token slice from the doc.
+	stringTokenFetcher := &FirestoreTokenAdapter{docFetcher: stringDocFetcher}
+
+	// 3. Wrap the string-keyed fetcher in our URN adapter.
+	urnAdapter := NewURNTokenFetcherAdapter(stringTokenFetcher)
+
+	return urnAdapter, nil
 }
 
 // NewTestConsumer creates a concrete GooglePubsubConsumer for testing purposes.

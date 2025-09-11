@@ -1,4 +1,3 @@
-// Package pipeline contains the core data processing logic of the routing service.
 package pipeline
 
 import (
@@ -8,6 +7,7 @@ import (
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/pkg/routing"
 	"github.com/rs/zerolog"
 )
@@ -16,8 +16,9 @@ import (
 // It accepts dependencies for caching, delivery, and offline storage, returning
 // a configured messagepipeline.StreamProcessor.
 func NewRoutingProcessor(
-	presenceCache cache.Fetcher[string, routing.ConnectionInfo],
-	deviceTokenFetcher cache.Fetcher[string, []routing.DeviceToken],
+	// REFACTOR: The caches are now keyed by the type-safe urn.URN.
+	presenceCache cache.Fetcher[urn.URN, routing.ConnectionInfo],
+	deviceTokenFetcher cache.Fetcher[urn.URN, []routing.DeviceToken],
 	deliveryProducer routing.DeliveryProducer,
 	pushNotifier routing.PushNotifier,
 	messageStore routing.MessageStore,
@@ -28,46 +29,52 @@ func NewRoutingProcessor(
 	return func(ctx context.Context, original messagepipeline.Message, envelope *transport.SecureEnvelope) error {
 		var err error
 
+		// The envelope's RecipientID is now a urn.URN from the transport package.
+		procLogger := logger.With().Str("recipientID", envelope.RecipientID.String()).Logger()
+
 		// Strategy 1: Check if the user is online via the presence cache.
+		// REFACTOR: Pass the urn.URN directly to the cache.
 		connInfo, err := presenceCache.Fetch(ctx, envelope.RecipientID)
 		if err == nil {
 			// The user is online. Forward the envelope to the specific server
 			// instance handling their connection.
 			deliveryTopic := "delivery-" + connInfo.ServerInstanceID
-			logger.Info().
-				Str("recipientID", envelope.RecipientID).
+			procLogger.Info().
 				Str("deliveryTopic", deliveryTopic).
 				Msg("User is online. Forwarding message.")
 
 			err = deliveryProducer.Publish(ctx, deliveryTopic, envelope)
 			if err != nil {
-				return fmt.Errorf("failed to publish to delivery topic %s for user %s: %w", deliveryTopic, envelope.RecipientID, err)
+				return fmt.Errorf("failed to publish to delivery topic %s for user %s: %w", deliveryTopic, envelope.RecipientID.String(), err)
 			}
 			return nil // Success
 		}
 
 		// Strategy 2: User is offline. Persist the message and then attempt a push notification.
-		logger.Info().
-			Str("recipientID", envelope.RecipientID).
-			Msg("User is offline. Storing message and attempting push notification.")
+		procLogger.Info().Msg("User is offline. Storing message and attempting push notification.")
 
-		err = messageStore.Store(ctx, envelope.RecipientID, envelope)
+		// REFACTOR: Call the correct StoreMessages method from the updated interface.
+		err = messageStore.StoreMessages(ctx, envelope.RecipientID, []*transport.SecureEnvelope{envelope})
 		if err != nil {
-			return fmt.Errorf("failed to store message for offline user %s: %w", envelope.RecipientID, err)
+			return fmt.Errorf("failed to store message for offline user %s: %w", envelope.RecipientID.String(), err)
 		}
 
+		// REFACTOR: Pass the urn.URN directly to the cache.
 		deviceTokens, err := deviceTokenFetcher.Fetch(ctx, envelope.RecipientID)
 		if err != nil {
-			logger.Warn().
+			procLogger.Warn().
 				Err(err).
-				Str("recipientID", envelope.RecipientID).
 				Msg("Could not retrieve device tokens for user. Message is stored.")
 			return nil
 		}
 
 		err = pushNotifier.Notify(ctx, deviceTokens, envelope)
 		if err != nil {
-			return fmt.Errorf("failed to send push notification to user %s: %w", envelope.RecipientID, err)
+			// Not returning the error here, as the message has been successfully stored.
+			// A failed push notification should not cause the entire message to be re-processed.
+			procLogger.Error().
+				Err(err).
+				Msg("Failed to send push notification.")
 		}
 
 		return nil // Success

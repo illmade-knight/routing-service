@@ -8,7 +8,8 @@ import (
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/illmade-knight/routing-service/internal/pipeline" // Updated import
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
+	"github.com/illmade-knight/routing-service/internal/pipeline"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,10 +18,15 @@ func TestEnvelopeTransformer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	// Using the correct SecureEnvelope struct as you provided.
+	// REFACTOR: Use the correct, URN-based SecureEnvelope struct.
+	senderURN, err := urn.Parse("urn:sm:user:user-alice")
+	require.NoError(t, err)
+	recipientURN, err := urn.Parse("urn:sm:user:user-bob")
+	require.NoError(t, err)
+
 	validEnvelope := transport.SecureEnvelope{
-		SenderID:              "user-alice",
-		RecipientID:           "user-bob",
+		SenderID:              senderURN,
+		RecipientID:           recipientURN,
 		EncryptedData:         []byte("encrypted-payload"),
 		EncryptedSymmetricKey: []byte("encrypted-key"),
 		Signature:             []byte("signature"),
@@ -80,6 +86,7 @@ func TestEnvelopeTransformer(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Act
+			// REFACTOR: Correctly pass the inputMessage field from the test case struct.
 			actualEnvelope, actualSkip, actualErr := pipeline.EnvelopeTransformer(ctx, tc.inputMessage)
 
 			// Assert

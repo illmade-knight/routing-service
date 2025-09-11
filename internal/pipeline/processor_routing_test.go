@@ -8,6 +8,7 @@ import (
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/illmade-knight/routing-service/internal/pipeline"
 	"github.com/illmade-knight/routing-service/pkg/routing"
 	"github.com/rs/zerolog"
@@ -17,16 +18,12 @@ import (
 
 // --- Mocks using testify/mock ---
 
-// REFACTOR: Use testify/mock for all mocks to ensure completeness and provide
-// better expectation setting and assertion capabilities.
-
 type mockFetcher[K comparable, V any] struct {
 	mock.Mock
 }
 
 func (m *mockFetcher[K, V]) Fetch(ctx context.Context, key K) (V, error) {
 	args := m.Called(ctx, key)
-	// Type assertion to handle the generic return value.
 	var result V
 	if val, ok := args.Get(0).(V); ok {
 		result = val
@@ -34,7 +31,6 @@ func (m *mockFetcher[K, V]) Fetch(ctx context.Context, key K) (V, error) {
 	return result, args.Error(1)
 }
 
-// NOTE: Adding the missing Close method to satisfy the interface.
 func (m *mockFetcher[K, V]) Close() error {
 	args := m.Called()
 	return args.Error(0)
@@ -62,16 +58,24 @@ type mockMessageStore struct {
 	mock.Mock
 }
 
-func (m *mockMessageStore) Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error {
-	args := m.Called(ctx, userID, envelope)
+// REFACTOR: Implement the new routing.MessageStore interface.
+func (m *mockMessageStore) StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error {
+	args := m.Called(ctx, recipient, envelopes)
 	return args.Error(0)
 }
-func (m *mockMessageStore) FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error) {
-	args := m.Called(ctx, userID)
-	return args.Get(0).([]*transport.SecureEnvelope), args.Error(1)
+
+func (m *mockMessageStore) RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error) {
+	args := m.Called(ctx, recipient)
+	// Type assertion to handle the slice of pointers.
+	var result []*transport.SecureEnvelope
+	if val, ok := args.Get(0).([]*transport.SecureEnvelope); ok {
+		result = val
+	}
+	return result, args.Error(1)
 }
-func (m *mockMessageStore) MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error {
-	args := m.Called(ctx, userID, envelopes)
+
+func (m *mockMessageStore) DeleteMessages(ctx context.Context, recipient urn.URN, messageIDs []string) error {
+	args := m.Called(ctx, recipient, messageIDs)
 	return args.Error(0)
 }
 
@@ -82,21 +86,29 @@ func TestRoutingProcessor(t *testing.T) {
 	t.Cleanup(cancel)
 
 	nopLogger := zerolog.Nop()
+	// REFACTOR: Use a valid URN for the test envelope.
+	testURN, err := urn.Parse("urn:sm:user:user-bob")
+	require.NoError(t, err)
+
 	testEnvelope := &transport.SecureEnvelope{
-		RecipientID: "user-bob",
+		RecipientID: testURN,
 	}
 	testMessage := messagepipeline.Message{}
 
 	t.Run("Happy Path - User is Online", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		// REFACTOR: Mocks are now parameterized with the urn.URN type.
+		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
 		deliveryProducer := new(mockDeliveryProducer)
+		// These mocks are not used in this path.
+		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
+		pushNotifier := new(mockPushNotifier)
 		messageStore := new(mockMessageStore)
 
-		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{ServerInstanceID: "pod-123"}, nil)
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{ServerInstanceID: "pod-123"}, nil)
 		deliveryProducer.On("Publish", mock.Anything, "delivery-pod-123", testEnvelope).Return(nil)
 
-		processor := pipeline.NewRoutingProcessor(presenceCache, nil, deliveryProducer, nil, messageStore, nopLogger)
+		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, deliveryProducer, pushNotifier, messageStore, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
@@ -109,18 +121,20 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Happy Path - User is Offline with Device Tokens", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
-		deviceTokenFetcher := new(mockFetcher[string, []routing.DeviceToken])
+		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
 		pushNotifier := new(mockPushNotifier)
+		deliveryProducer := new(mockDeliveryProducer) // Not used
 		deviceTokens := []routing.DeviceToken{{Token: "device-abc"}}
 
-		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
-		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(nil)
-		deviceTokenFetcher.On("Fetch", mock.Anything, "user-bob").Return(deviceTokens, nil)
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		// REFACTOR: Expect a call to StoreMessages with the correct arguments.
+		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
+		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(deviceTokens, nil)
 		pushNotifier.On("Notify", mock.Anything, deviceTokens, testEnvelope).Return(nil)
 
-		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier, messageStore, nopLogger)
+		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, deliveryProducer, pushNotifier, messageStore, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
@@ -132,14 +146,14 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Offline - No Device Tokens Found", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
-		deviceTokenFetcher := new(mockFetcher[string, []routing.DeviceToken])
+		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
-		pushNotifier := new(mockPushNotifier) // Not called, so no expectations set
+		pushNotifier := new(mockPushNotifier) // Not called
 
-		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
-		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(nil)
-		deviceTokenFetcher.On("Fetch", mock.Anything, "user-bob").Return([]routing.DeviceToken(nil), errors.New("no tokens"))
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
+		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return([]routing.DeviceToken(nil), errors.New("no tokens"))
 
 		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier, messageStore, nopLogger)
 
@@ -154,12 +168,12 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Offline - Message Store Fails", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[string, routing.ConnectionInfo])
+		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
 		messageStore := new(mockMessageStore)
 		expectedErr := "db is down"
 
-		presenceCache.On("Fetch", mock.Anything, "user-bob").Return(routing.ConnectionInfo{}, errors.New("not found"))
-		messageStore.On("Store", mock.Anything, "user-bob", testEnvelope).Return(errors.New(expectedErr))
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(errors.New(expectedErr))
 
 		processor := pipeline.NewRoutingProcessor(presenceCache, nil, nil, nil, messageStore, nopLogger)
 

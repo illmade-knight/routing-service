@@ -1,4 +1,8 @@
-// Package persistence contains concrete storage implementations.
+// REFACTOR: This file now uses Firestore Transactions (client.RunTransaction)
+// for all batch write operations. This is the correct, modern, non-deprecated
+// approach for ensuring synchronous, atomic writes, which is required by the
+// service's transactional logic.
+
 package persistence
 
 import (
@@ -8,6 +12,8 @@ import (
 	"cloud.google.com/go/firestore"
 	"github.com/google/uuid"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
+	"github.com/illmade-knight/routing-service/pkg/routing"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -25,7 +31,7 @@ type FirestoreStore struct {
 }
 
 // NewFirestoreStore is the constructor for the FirestoreStore.
-func NewFirestoreStore(client *firestore.Client, logger zerolog.Logger) (*FirestoreStore, error) {
+func NewFirestoreStore(client *firestore.Client, logger zerolog.Logger) (routing.MessageStore, error) {
 	if client == nil {
 		return nil, fmt.Errorf("firestore client cannot be nil")
 	}
@@ -36,39 +42,53 @@ func NewFirestoreStore(client *firestore.Client, logger zerolog.Logger) (*Firest
 	return store, nil
 }
 
-// Store saves a message envelope for a specific user in Firestore.
-func (s *FirestoreStore) Store(ctx context.Context, userID string, envelope *transport.SecureEnvelope) error {
-	// REFACTOR: If the incoming envelope does not have a MessageID, generate one.
-	// This makes the service more robust and removes the burden from the client,
-	// as the ID is only used for internal storage management.
-	if envelope.MessageID == "" {
-		envelope.MessageID = uuid.NewString()
-		s.logger.Warn().
-			Str("newId", envelope.MessageID).
-			Str("recipientID", userID).
-			Msg("Generated new MessageID for incoming envelope.")
+// StoreMessages saves a slice of message envelopes for a specific recipient URN in Firestore.
+func (s *FirestoreStore) StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error {
+	if len(envelopes) == 0 {
+		return nil
 	}
+	recipientKey := recipient.String()
 
-	docRef := s.client.Collection(usersCollection).Doc(userID).Collection(messagesCollection).Doc(envelope.MessageID)
-	_, err := docRef.Set(ctx, envelope)
+	err := s.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		colRef := s.client.Collection(usersCollection).Doc(recipientKey).Collection(messagesCollection)
+
+		for _, envelope := range envelopes {
+			if envelope.MessageID == "" {
+				envelope.MessageID = uuid.NewString()
+				s.logger.Warn().
+					Str("newId", envelope.MessageID).
+					Str("recipientID", recipientKey).
+					Msg("Generated new MessageID for incoming envelope.")
+			}
+			docRef := colRef.Doc(envelope.MessageID)
+			// Use the transaction to perform the Set operation.
+			err := tx.Set(docRef, envelope)
+			if err != nil {
+				return err // This will cause the transaction to roll back.
+			}
+		}
+		return nil
+	})
+
 	if err != nil {
-		return fmt.Errorf("failed to store message %s for user %s: %w", envelope.MessageID, userID, err)
+		return fmt.Errorf("transaction failed for user %s: %w", recipientKey, err)
 	}
 	return nil
 }
 
-// FetchUndelivered retrieves all messages for a user that have not yet been delivered.
-func (s *FirestoreStore) FetchUndelivered(ctx context.Context, userID string) ([]*transport.SecureEnvelope, error) {
+// RetrieveMessages retrieves all messages for a recipient that have not yet been delivered.
+func (s *FirestoreStore) RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error) {
 	var envelopes []*transport.SecureEnvelope
+	recipientKey := recipient.String()
 
-	colRef := s.client.Collection(usersCollection).Doc(userID).Collection(messagesCollection)
+	colRef := s.client.Collection(usersCollection).Doc(recipientKey).Collection(messagesCollection)
 	docs, err := colRef.Documents(ctx).GetAll()
 	if err != nil {
 		// It's not an error if the user's document or collection doesn't exist yet.
 		if status.Code(err) == codes.NotFound {
 			return envelopes, nil
 		}
-		return nil, fmt.Errorf("failed to fetch documents for user %s: %w", userID, err)
+		return nil, fmt.Errorf("failed to fetch documents for user %s: %w", recipientKey, err)
 	}
 
 	for _, doc := range docs {
@@ -79,7 +99,7 @@ func (s *FirestoreStore) FetchUndelivered(ctx context.Context, userID string) ([
 			s.logger.Error().
 				Err(err).
 				Str("documentID", doc.Ref.ID).
-				Str("userID", userID).
+				Str("recipientID", recipientKey).
 				Msg("Failed to decode message from firestore")
 			continue
 		}
@@ -89,33 +109,39 @@ func (s *FirestoreStore) FetchUndelivered(ctx context.Context, userID string) ([
 	return envelopes, nil
 }
 
-// MarkDelivered marks a set of messages as delivered by deleting them from Firestore.
-func (s *FirestoreStore) MarkDelivered(ctx context.Context, userID string, envelopes []*transport.SecureEnvelope) error {
-	if len(envelopes) == 0 {
+// DeleteMessages marks a set of messages as delivered by deleting them from Firestore.
+func (s *FirestoreStore) DeleteMessages(ctx context.Context, recipient urn.URN, messageIDs []string) error {
+	if len(messageIDs) == 0 {
 		return nil
 	}
+	recipientKey := recipient.String()
 
-	batch := s.client.Batch()
-	colRef := s.client.Collection(usersCollection).Doc(userID).Collection(messagesCollection)
+	err := s.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		colRef := s.client.Collection(usersCollection).Doc(recipientKey).Collection(messagesCollection)
 
-	for _, envelope := range envelopes {
-		if envelope.MessageID == "" {
-			s.logger.Warn().Str("userID", userID).Msg("Encountered envelope with no ID during MarkDelivered")
-			continue
+		for _, msgID := range messageIDs {
+			if msgID == "" {
+				s.logger.Warn().Str("recipientID", recipientKey).Msg("Encountered empty message ID during DeleteMessages")
+				continue
+			}
+			docRef := colRef.Doc(msgID)
+			// Use the transaction to perform the Delete operation.
+			err := tx.Delete(docRef)
+			if err != nil {
+				return err // This will cause the transaction to roll back.
+			}
 		}
-		docRef := colRef.Doc(envelope.MessageID)
-		batch.Delete(docRef)
-	}
+		return nil
+	})
 
-	_, err := batch.Commit(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to commit batch delete for user %s: %w", userID, err)
+		return fmt.Errorf("transaction failed for batch delete for user %s: %w", recipientKey, err)
 	}
 
 	s.logger.Info().
-		Str("userID", userID).
-		Int("count", len(envelopes)).
-		Msg("Successfully marked messages as delivered")
+		Str("recipientID", recipientKey).
+		Int("count", len(messageIDs)).
+		Msg("Successfully deleted delivered messages")
 
 	return nil
 }
