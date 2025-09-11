@@ -10,58 +10,83 @@ The architecture is built around a **Unified Ingestion Pipeline** using the go-d
 
 The repository is organized using standard Go project layout conventions to maintain a clear separation between public APIs, internal logic, and the final executable.
 
-Plaintext
-
-.  
-├── cmd/  
-│   └── routing-service/  
-│       └── main.go              \# Assembles and runs the service  
-├── e2e/  
-│   └── routing\_e2e\_test.go      \# End-to-end integration tests  
-├── internal/  
-│   ├── api/                     \# Private HTTP API handlers  
-│   ├── pipeline/                \# Core message processing stages (transform, process)  
-│   └── platform/                \# Concrete adapters for external services (e.g., Pub/Sub)  
-├── pkg/  
-│   └── routing/                 \# Public "contract" (domain models, interfaces, config)  
-├── routingservice/  
-│   └── service.go               \# The public, embeddable service library/wrapper  
-└── test/  
+├── cmd/    
+│   └── routing-service/    
+│       └── main.go              \# Assembles and runs the service    
+├── e2e/    
+│   └── routing\_e2e\_test.go      \# End-to-end integration tests    
+├── internal/    
+│   ├── api/                     \# Private HTTP API handlers    
+│   ├── pipeline/                \# Core message processing stages (transform, process)    
+│   └── platform/                \# Concrete adapters for external services (e.g., Pub/Sub, Firestore)  
+├── pkg/    
+│   └── routing/                 \# Public "contract" (domain models, interfaces, config)    
+├── routingservice/    
+│   └── service.go               \# The public, embeddable service library/wrapper    
+└── test/    
 └── e2e\_helpers.go           \# Public test helpers for E2E tests
 
-* **cmd/**: Contains the executable entry point for the service. Its main.go file is responsible for reading configuration, creating concrete dependencies (like a real Google Pub/Sub client), and injecting them into the service wrapper to run the application.
-* **e2e/**: Holds the end-to-end integration tests. These tests treat the service as a black box, interacting with its public APIs (like the HTTP endpoint) to validate the entire workflow.
-* **internal/**: Contains all the private application logic that cannot be imported by other projects. This includes the HTTP handlers (api), the core pipeline logic (pipeline), and the concrete adapters for external services (platform).
-* **pkg/**: Holds public, shareable libraries. pkg/routing is the service's public contract, defining the data structures, interfaces, and configuration that other services or the application's own entry point can use.
-* **routingservice/**: The primary, public-facing service library. It provides the Wrapper and its constructor, New(), which assembles the internal components into a runnable service. It is designed to be imported by executables.
-* **test/**: Provides public helper functions specifically for testing. This allows our e2e tests to create concrete service dependencies without violating the internal package boundary.
+* **cmd/**: Contains the executable entry point for the service.
+* **e2e/**: Holds the end-to-end integration tests that treat the service as a black box.
+* **internal/**: Contains all private application logic, including HTTP handlers, the core pipeline, and concrete platform adapters.
+* **pkg/**: Holds the service's public contract, defining the data structures, interfaces, and configuration.
+* **routingservice/**: The primary, public-facing service library that assembles the internal components into a runnable service.
+* **test/**: Provides public helper functions for testing, allowing E2E tests to create dependencies without violating the internal package boundary.
 
 ---
 
-## **Current State vs. Roadmap**
+## **Core Dataflow**
 
-The refactoring has successfully established the core architecture, which allows for direct integration with the pre-built components from the go-dataflow library. A significant portion of **Phase 1** is either complete or ready for immediate integration.
+The service operates on two primary dataflows: sending a message into the pipeline and retrieving stored messages.
 
-### **What's Complete (Phase 1 Foundation)**
+### **1\. Sending a Message (POST /send)**
 
-The current codebase provides a robust and fully decoupled foundation for the Unified Ingestion Pipeline.
+This flow handles the ingestion and routing of a new message.
 
-* ✅ **HTTP Ingestion:** The POST /send endpoint is implemented and publishes messages to the central message bus.
-* ✅ **Message Processing Pipeline:** A fully functional StreamingService is in place. It is designed to use a GooglePubsubConsumer to subscribe to the ingress topic, a Transformer to parse the SecureEnvelope, and a Processor to handle the routing logic.
-* ✅ **Core Routing Logic:** The Processor contains the complete logic for checking user presence and deciding between online and offline delivery paths. It depends on generic Fetcher interfaces for its data lookups.
+graph TD  
+A\[Client App\] \--\> B{HTTP API: POST /send};  
+B \--\> C\[Pub/Sub: Ingress Topic\];  
+C \--\> D\[Processing Pipeline\];  
+D \--\> E{Check Presence Cache};  
+E \-- User Online \--\> F\[Pub/Sub: Delivery Topic\];  
+E \-- User Offline \--\> G{Store Message in Firestore};  
+G \--\> H\[Send Push Notification\];
+
+### **2\. Retrieving Offline Messages (GET /messages)**
+
+This flow allows a client to fetch messages that were stored while it was offline.
+
+graph TD  
+A\[Client App\] \--\> B{HTTP API: GET /messages};  
+B \--\> C{Message Store: Firestore};  
+C \-- Fetches Messages \--\> B;  
+B \-- Returns Messages \--\> A;  
+B \-- Marks as Delivered \--\> C;
+
+---
+
+## **Project Status & Roadmap**
+
+The service now has a complete, end-to-end implementation for asynchronous, offline-first messaging. A significant portion of **Phase 1** is complete.
+
+### **What's Complete (Phase 1\)**
+
+* ✅ **HTTP Ingestion**: The POST /send endpoint is implemented and publishes messages to the central message bus.
+* ✅ **Message Processing Pipeline**: A fully functional StreamingService is in place, using a GooglePubsubConsumer, a Transformer, and a Processor.
+* ✅ **Core Routing Logic**: The Processor contains the complete logic for checking user presence and deciding between online and offline delivery, including **persisting messages for offline users**.
+* ✅ **Offline Message Persistence**: The pipeline now uses a MessageStore interface, with a concrete **Firestore implementation**, to save messages for offline users.
+* ✅ **Message Retrieval API**: The GET /messages endpoint is implemented, allowing clients to securely fetch and clear their stored messages after coming online.
 
 ### **Ready for Integration (Phase 1 Data Adapters)**
 
-The "missing" data adapters from the roadmap do not need to be re-implemented. The next step is to instantiate and inject the existing, generic implementations from the go-dataflow library within cmd/routing-service/main.go.
+The next step is to replace the in-memory/mock data adapters with robust, scalable implementations from the go-dataflow library within cmd/routing-service/main.go.
 
-* ➡️ **Redis for Presence:** The PresenceCache dependency can be satisfied by instantiating cache.NewRedisCache\[string, routing.ConnectionInfo\] from go-dataflow. This cache should be configured with no fallback, as a miss in Redis definitively means the user is offline.
-* ➡️ **Firestore for Device Tokens:** The DeviceTokenFetcher dependency can be satisfied by instantiating cache.NewFirestore\[string, \[\]routing.DeviceToken\] from go-dataflow. For improved performance, this Firestore fetcher can be used as the fallback for another caching layer, such as RedisCache or InMemoryLRUCache.
+* ➡️ **Redis for Presence**: The PresenceCache dependency can be satisfied by instantiating cache.NewRedisCache\[string, routing.ConnectionInfo\]. A cache miss definitively means the user is offline.
+* ➡️ **Firestore for Device Tokens**: The DeviceTokenFetcher dependency can be satisfied by instantiating cache.NewFirestore\[string, \[\]routing.DeviceToken\]. This can be layered with a Redis or in-memory cache for better performance.
 
-### **What's Next (Future Roadmap Items)**
+### **Future Roadmap**
 
-The following major components from the roadmap have not yet been started and represent the next phases of development:
-
-* ❌ **MQTT Ingestion:** The MQTT ingestion point needs to be built and configured to produce to the same ingress topic.
-* ❌ **Phase 2 \- Real-time Delivery:** The entire real-time connection manager, including the **WebSocket handler** and **MQTT publisher** for delivering messages to online clients, needs to be implemented.
-* ❌ **Phase 2 \- Additional APIs:** The GET /connect (WebSocket) and POST /register-device endpoints are not yet created.
-* ❌ **Phase 3/4 \- Production Hardening:** Features like JWT authentication, observability, and deployment configurations are still pending.
+* ❌ **MQTT Ingestion**: An MQTT broker needs to be added as another entry point to the unified ingestion topic.
+* ❌ **Phase 2 \- Real-time Delivery**: The real-time connection manager, including the **WebSocket handler** for delivering messages to online clients, needs to be implemented.
+* ❌ **Phase 2 \- Additional APIs**: The GET /connect (WebSocket upgrade) and POST /register-device endpoints are not yet created.
+* ❌ **Phase 3/4 \- Production Hardening**: Features like JWT authentication, observability (metrics, tracing), and deployment configurations are pending.
