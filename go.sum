@@ -164,8 +164,8 @@ github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.2 h1:8Tjv8EJ+pM1xP8mK6egEbD1OgnV
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.2/go.mod h1:pkJQ2tZHJ0aFOVEEot6oZmaVEZcRme73eIFmhiVuRWs=
 github.com/illmade-knight/go-dataflow v0.3.4-beta h1:qGni3VghW6ILfJUsn2XtFW4I6iruOjkd3mY3mV/kV+k=
 github.com/illmade-knight/go-dataflow v0.3.4-beta/go.mod h1:wD4l9m7syAMgkt/Gd1Czfk01lDz5m6x+Oi8fPIdD8N0=
-github.com/illmade-knight/go-secure-messaging v0.0.6-beta h1:5zBrb3KjhDpvdbThBndp/byG9c1GV/fGGJXTT6uUoYM=
-github.com/illmade-knight/go-secure-messaging v0.0.6-beta/go.mod h1:UTCrKu/3242vbN7GkLGKgjfh59yUKcTenxnVPmzcRAQ=
+github.com/illmade-knight/go-secure-messaging v0.0.9-beta h1:ehvoEEZie2FOjfkw2xo/P57s8cUZFcuMhvXhcYmGzHo=
+github.com/illmade-knight/go-secure-messaging v0.0.9-beta/go.mod h1:UTCrKu/3242vbN7GkLGKgjfh59yUKcTenxnVPmzcRAQ=
 github.com/illmade-knight/go-test v0.0.6 h1:a1snqy0GIEfnlrKg9u4X9gmMN7rNIgWRuDI+V5nlHes=
 github.com/illmade-knight/go-test v0.0.6/go.mod h1:lxtdPQYpGXVyyUvm59/ZCcYCS4UYvbqaRne0uTbtqOs=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=

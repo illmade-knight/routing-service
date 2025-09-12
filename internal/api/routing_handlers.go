@@ -79,7 +79,7 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var recipientURN urn.URN
 	// We wrap the header in quotes to make it a valid JSON string for unmarshaling.
 	err := json.Unmarshal([]byte(`"`+recipientHeader+`"`), &recipientURN)
-	if err != nil || recipientURN.IsZero() || recipientURN.EntityType != urn.EntityTypeUser {
+	if err != nil || recipientURN.IsZero() || recipientURN.EntityType() != urn.EntityTypeUser {
 		a.logger.Warn().Err(err).Str("header_value", recipientHeader).Msg("Invalid or non-user X-User-ID format")
 		http.Error(w, "Invalid X-User-ID format", http.StatusBadRequest)
 		return
