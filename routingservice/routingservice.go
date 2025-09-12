@@ -28,7 +28,7 @@ func New(
 	cfg *routing.Config,
 	deps *routing.Dependencies,
 	consumer messagepipeline.MessageConsumer, // Accepts the generic consumer
-	producer routing.IngestionProducer, // Accepts the generic producer
+	producer routing.IngestionProducer,       // Accepts the generic producer
 	logger zerolog.Logger,
 ) (*Wrapper, error) {
 	var err error
@@ -119,4 +119,9 @@ func (w *Wrapper) Shutdown(ctx context.Context) error {
 	}
 	w.logger.Info().Msg("Service shutdown complete.")
 	return finalErr
+}
+
+// Handler returns the underlying http.Handler for the service.
+func (w *Wrapper) Handler() http.Handler {
+	return w.apiServer.Handler
 }
