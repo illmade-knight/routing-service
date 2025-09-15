@@ -1,14 +1,21 @@
 # **Routing Service**
 
-The Routing Service is a high-performance, secure, and scalable microservice responsible for the real-time delivery of SecureEnvelope messages between clients. It acts as a "dumb pipe," routing messages based on their unencrypted headers with zero knowledge of the encrypted payload, ensuring end-to-end security.
+The Routing Service is a high-performance, secure, and scalable microservice responsible for the real-time delivery of SecureEnvelope messages between clients. 
+It acts as a "dumb pipe," routing messages based on their unencrypted headers with zero knowledge of the encrypted payload, ensuring end-to-end security.
 
-The architecture is built around a **Unified Ingestion Pipeline** using the go-dataflow library. This allows multiple transport protocols (e.g., HTTP, MQTT) to produce messages to a central message bus, which are then consumed by a single, scalable backend that performs the core routing logic.
+The architecture is built around a **Unified Ingestion Pipeline** using the dataflow library. This allows multiple transport protocols (e.g., HTTP, MQTT) to produce messages to a central message bus, which are then consumed by a single, scalable backend that performs the core routing logic.
 
 ---
+## **Prompt Strategy **
+
+This repo, following our usual procedure, now holds the requirements <-> prompts <-> code model for routing-service
+
+The golang implementation is now held in [go-routing-service](https://github.com/illmade-knight/go-routing-service)
+
 
 ## **Directory Structure**
 
-The repository is organized using standard Go project layout conventions to maintain a clear separation between public APIs, internal logic, and the final executable.
+For the golang implementation the repository is organized using standard Go project layout conventions to maintain a clear separation between public APIs, internal logic, and the final executable.
 
 ├── cmd/    
 │   └── routing-service/    
